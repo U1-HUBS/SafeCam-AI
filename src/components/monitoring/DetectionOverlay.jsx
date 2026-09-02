@@ -35,20 +35,16 @@ export const DetectionOverlay = ({ detections = [], containerWidth = 800, contai
           ? "glow-red"
           : "glow-green";
 
-        let labelText = `ID: ${pId}`;
-        if (action === "MUTUAL_FIGHT" || action_label === "MUTUAL FIGHT") {
-          labelText = "⚠️ MUTUAL FIGHT";
-        } else if (isAttacker) {
-          const actName = (action_label || action || "BULLY")
-            .replace("BULLY — ", "")
-            .replace("ATTACKER — ", "")
-            .replace("_ATTACKER", "")
-            .replace("_", " ");
-          labelText = `🔴 BULLY — ${actName.toUpperCase()}`;
+        let labelText = `ID:${pId}`;
+        const actClean = (action_label || action || "NORMAL").toUpperCase();
+        if (isAttacker) {
+          labelText = `ID:${pId} ${actClean} - ATTACKER`;
         } else if (isVictim) {
-          labelText = "🟢 VICTIM";
-        } else if (action_label === "UNKNOWN") {
-          labelText = `ID: ${pId} • UNKNOWN`;
+          labelText = `ID:${pId} NORMAL - VICTIM`;
+        } else if (actClean === "PUNCH" || actClean === "KICK") {
+          labelText = `ID:${pId} ${actClean}`;
+        } else {
+          labelText = `ID:${pId} NORMAL`;
         }
 
         return (

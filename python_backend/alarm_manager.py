@@ -1,10 +1,29 @@
+"""
+SAFECAM — Alarm Manager (Single Source of Truth)
+=================================================
+Manages alarm state, incident records, and persistence for all cameras.
+
+State Machine per camera:
+  IDLE → CONFIRMING → ALARM_ACTIVE → BULLYING_STOPPING → COOLDOWN → IDLE
+
+Key design rules:
+  - Alarm turns ON only when BullyingResult.bullying_confirmed == True
+  - Alarm stays ON while bullying continues (never restarts per frame)
+  - Alarm turns OFF only after BULLYING_STOP_FRAMES consecutive non-bullying frames
+    (but this is managed by BullyingStateMachine → result.state == "SAVE_CLIP")
+  - Clip path is set later by camera_stream after the post-event recording finishes
+  - Never overwrite an existing clip
+  - Incident JSON is saved to incidents/incidents.json
+"""
+
 import os
 import cv2
 import json
 import time
 import threading
-from datetime import datetime
+from datetime   import datetime
 from collections import defaultdict
+
 try:
     from alarm_config import alarm_config
 except ImportError:
@@ -14,22 +33,15 @@ except ImportError:
 class AlarmManager:
     """
     SAFECAM AI Single Source of Truth Backend Alarm Manager.
-    
-    State Machine per Camera:
-    IDLE → SUSPICIOUS → CONFIRMING → BULLYING_CONFIRMED / ALARM_ACTIVE → COOLDOWN → IDLE
-    
-    Rules & Features:
-    - Requires MIN_CONSECUTIVE_FRAMES (default: 4) above threshold before triggering ALARM_ACTIVE.
-    - Resets confirmation counter if evidence drops before threshold is met.
-    - Manages single active incident per camera without duplicating alerts every frame.
-    - Saves 1080p MP4 incident clips and JPEG snapshots to python_backend/incidents/.
-    - Maintains persisted incidents.json history file.
+
+    Singleton — one instance shared across the entire process.
     """
+
     _instance = None
-    _lock = threading.Lock()
+    _cls_lock = threading.Lock()
 
     def __new__(cls):
-        with cls._lock:
+        with cls._cls_lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
                 cls._instance._init_manager()
@@ -38,20 +50,19 @@ class AlarmManager:
     def _init_manager(self):
         self.config = alarm_config
         os.makedirs(self.config.INCIDENTS_DIR, exist_ok=True)
-        
+
         self.incidents_json_path = os.path.join(self.config.INCIDENTS_DIR, "incidents.json")
         self.lock = threading.Lock()
-        
-        # Camera ID -> State Dict
-        self.camera_states = {}
-        
-        # Camera ID -> Incident Frame Buffer for MP4 saving
-        self.clip_frame_buffers = defaultdict(list)
-        
-        # Loaded Incident History
-        self.incidents_history = self._load_incidents_history()
 
-    def _load_incidents_history(self):
+        # camera_id → state dict
+        self.camera_states: dict = {}
+
+        # Loaded incident history
+        self.incidents_history: list = self._load_incidents()
+
+    # ---------------------------------------------------------------- persist
+
+    def _load_incidents(self) -> list:
         if os.path.exists(self.incidents_json_path):
             try:
                 with open(self.incidents_json_path, "r") as f:
@@ -60,254 +71,318 @@ class AlarmManager:
                 print(f"[ALARM MANAGER] Warning: Could not read incidents.json: {e}")
         return []
 
-    def _save_incidents_history(self):
+    def _save_incidents(self):
         try:
             with open(self.incidents_json_path, "w") as f:
                 json.dump(self.incidents_history, f, indent=2)
         except Exception as e:
             print(f"[ALARM MANAGER] Error saving incidents.json: {e}")
 
-    def get_default_state(self, camera_id):
+    # ---------------------------------------------------------------- state
+
+    def _default_state(self, camera_id: str) -> dict:
         return {
-            "camera_id": camera_id,
-            "alarm_active": False,
-            "state": "IDLE",
-            "incident_id": None,
-            "event_type": "NORMAL",
-            "action": None,
-            "confidence": 0.0,
-            "attacker_id": None,
-            "victim_id": None,
-            "started_at": None,
-            "last_detected_at": None,
-            "clip_path": None,
-            "snapshot_path": None,
-            "reason": "Normal Activity",
-            "consecutive_hits": 0,
-            "cooldown_remaining_sec": 0.0,
-            "acknowledged": False
+            "camera_id":             camera_id,
+            "alarm_active":          False,
+            "state":                 "IDLE",
+            "incident_id":           None,
+            "event_type":            "NORMAL",
+            "action":                None,
+            "attack_type":           None,
+            "confidence":            0.0,
+            "attacker_id":           None,
+            "victim_id":             None,
+            "started_at":            None,
+            "last_detected_at":      None,
+            "clip_path":             None,
+            "snapshot_path":         None,
+            "reason":                "Normal Activity",
+            "consecutive_hits":      0,
+            "cooldown_remaining_sec":0.0,
+            "acknowledged":          False,
+            "bullying_state":        "NORMAL",
+            "distance_normalized":   1.0,
+            "contact_overlap":       0.0,
         }
 
-    def update_camera_state(self, camera_id, frame_1080p, telemetry):
-        """
-        Updates single source of truth alarm state for camera_id based on AI telemetry.
-        Returns: Current camera alarm state dict.
-        """
+    def get_default_state(self, camera_id: str) -> dict:
+        return self._default_state(camera_id)
+
+    def get_camera_state(self, camera_id: str) -> dict:
         with self.lock:
-            if camera_id not in self.camera_states:
-                self.camera_states[camera_id] = self.get_default_state(camera_id)
+            return dict(self.camera_states.get(camera_id, self._default_state(camera_id)))
 
-            st = self.camera_states[camera_id]
-            now_ts = time.time()
-            now_iso = datetime.now().astimezone().isoformat()
-
-            persons = telemetry.get("tracked_persons", [])
-            fight_prob = telemetry.get("fight_probability", 0.0)
-            overall_status = telemetry.get("status", "NORMAL")
-            threat_level = telemetry.get("threat_level", "normal")
-
-            # Check for active attacker in verified real persons
-            verified_persons = [p for p in persons if p.get("is_verified_real_person", False)]
-            attacker_p = next((p for p in verified_persons if p.get("role") == "attacker"), None)
-            victim_p = next((p for p in verified_persons if p.get("role") == "victim"), None)
-
-            # Require verified real persons present if REQUIRE_REAL_PERSON is True
-            has_real_person = len(verified_persons) > 0 if self.config.REQUIRE_REAL_PERSON else True
-
-            has_confirmed_threat = has_real_person and (
-                attacker_p is not None
-                or fight_prob >= self.config.CONFIDENCE_THRESHOLD
-                or threat_level in ["aggressive", "bullying"]
-            )
-
-            # State Machine Transitions
-            current_state = st["state"]
-
-            if current_state == "COOLDOWN":
-                # Check cooldown expiry
-                cooldown_start = st.get("_cooldown_start", now_ts)
-                elapsed = now_ts - cooldown_start
-                rem = max(0.0, self.config.COOLDOWN_PERIOD_SEC - elapsed)
-                st["cooldown_remaining_sec"] = round(rem, 1)
-
-                # Keep alarm_active = True during cooldown unless acknowledged
-                if not st.get("acknowledged", False):
-                    st["alarm_active"] = True
-
-                if rem <= 0:
-                    print(f"[ALARM STATE] Camera {camera_id}: COOLDOWN -> IDLE (Ready for new incidents)")
-                    st["state"] = "IDLE"
-                    st["alarm_active"] = False
-                    st["consecutive_hits"] = 0
-                    st["incident_id"] = None
-                    st["acknowledged"] = False
-
-            elif has_confirmed_threat and current_state != "COOLDOWN":
-                st["consecutive_hits"] += 1
-                hit_count = st["consecutive_hits"]
-
-                if hit_count < self.config.MIN_CONSECUTIVE_FRAMES:
-                    st["state"] = "CONFIRMING"
-                    st["alarm_active"] = False
-                    st["confidence"] = round(fight_prob, 2)
-                    st["reason"] = f"Confirming Threat ({hit_count}/{self.config.MIN_CONSECUTIVE_FRAMES} frames)"
-                else:
-                    # CONFIRMED BULLYING TRIGGER
-                    if not st["alarm_active"]:
-                        # First frame of ALARM_ACTIVE -> Create Incident Record
-                        inc_num = len(self.incidents_history) + 1
-                        inc_id = f"INC-{datetime.now().strftime('%Y%m%d')}-{inc_num:03d}"
-                        
-                        st["state"] = "ALARM_ACTIVE"
-                        st["alarm_active"] = True
-                        st["incident_id"] = inc_id
-                        st["event_type"] = "BULLYING_CONFIRMED"
-                        st["started_at"] = now_iso
-                        st["last_detected_at"] = now_iso
-                        st["attacker_id"] = attacker_p.get("track_id") if attacker_p else None
-                        st["victim_id"] = victim_p.get("track_id") if victim_p else None
-                        st["action"] = attacker_p.get("action_label", "PHYSICAL VIOLENCE") if attacker_p else "PHYSICAL VIOLENCE"
-                        st["confidence"] = round(max(fight_prob, 0.88), 2)
-                        st["reason"] = f"Confirmed Violence ({int(st['confidence']*100)}% Confidence)"
-                        st["acknowledged"] = False
-
-                        # Save snapshot JPEG
-                        if frame_1080p is not None:
-                            snap_filename = f"{inc_id}_snap.jpg"
-                            snap_filepath = os.path.join(self.config.INCIDENTS_DIR, snap_filename)
-                            cv2.imwrite(snap_filepath, frame_1080p)
-                            st["snapshot_path"] = f"/incidents/{snap_filename}"
-
-                        print(f"\n==================================================")
-                        print(f" *** [CONFIRMED BULLYING ALARM TRIGGERED] ***")
-                        print(f" Camera:       {camera_id}")
-                        print(f" Incident ID:  {inc_id}")
-                        print(f" Action:       {st['action']}")
-                        print(f" Attacker ID:  {st['attacker_id']}")
-                        print(f" Victim ID:    {st['victim_id']}")
-                        print(f" Confidence:   {st['confidence']*100:.1f}%")
-                        print(f" Snapshot:     {st.get('snapshot_path')}")
-                        print(f"==================================================\n")
-
-                    else:
-                        # Ongoing ALARM_ACTIVE -> Update last_detected_at without duplicating incident ID
-                        st["last_detected_at"] = now_iso
-                        st["confidence"] = round(max(fight_prob, st["confidence"]), 2)
-                        if attacker_p:
-                            st["attacker_id"] = attacker_p.get("track_id")
-                        if victim_p:
-                            st["victim_id"] = victim_p.get("track_id")
-
-                    # Buffer frame for incident clip
-                    if frame_1080p is not None and len(self.clip_frame_buffers[camera_id]) < self.config.MAX_CLIP_FRAMES:
-                        self.clip_frame_buffers[camera_id].append(frame_1080p.copy())
-
-            else:
-                # Threat disappeared / Evidence dropped below threshold
-                if current_state in ["CONFIRMING", "SUSPICIOUS"]:
-                    print(f"[ALARM STATE] Camera {camera_id}: {current_state} -> IDLE (Evidence dropped)")
-                    st["state"] = "IDLE"
-                    st["consecutive_hits"] = 0
-                    st["alarm_active"] = False
-
-                elif current_state == "ALARM_ACTIVE":
-                    # Incident ended -> Finalize Incident Record & Transition to COOLDOWN
-                    print(f"\n[ALARM STATE] Camera {camera_id}: ALARM_ACTIVE -> COOLDOWN (Incident ended)")
-                    st["state"] = "COOLDOWN"
-                    st["alarm_active"] = True  # Keep alarm_active = True during cooldown for UI visibility
-                    st["_cooldown_start"] = now_ts
-                    st["cooldown_remaining_sec"] = self.config.COOLDOWN_PERIOD_SEC
-
-                    # Finalize MP4 video clip saving in background thread
-                    inc_id = st.get("incident_id", "INC-000")
-                    frames_to_save = list(self.clip_frame_buffers[camera_id])
-                    self.clip_frame_buffers[camera_id].clear()
-
-                    if frames_to_save and self.config.SAVE_CLIPS:
-                        clip_filename = f"{inc_id}_clip.mp4"
-                        clip_filepath = os.path.join(self.config.INCIDENTS_DIR, clip_filename)
-                        st["clip_path"] = f"/incidents/{clip_filename}"
-
-                        # Save incident log record to history
-                        inc_record = {
-                            "incident_id": inc_id,
-                            "camera_id": camera_id,
-                            "event_type": st["event_type"],
-                            "action": st["action"],
-                            "confidence": st["confidence"],
-                            "attacker_id": st["attacker_id"],
-                            "victim_id": st["victim_id"],
-                            "started_at": st["started_at"],
-                            "ended_at": now_iso,
-                            "reason": st["reason"],
-                            "snapshot_path": st.get("snapshot_path"),
-                            "clip_path": st.get("clip_path")
-                        }
-                        self.incidents_history.insert(0, inc_record)
-                        self._save_incidents_history()
-
-                        threading.Thread(
-                            target=self._save_mp4_clip,
-                            args=(clip_filepath, frames_to_save),
-                            daemon=True
-                        ).start()
-
-            return dict(st)
-
-    def _save_mp4_clip(self, filepath, frames):
-        """Asynchronously writes buffered 1080p frames to an MP4 video clip."""
-        if not frames:
-            return
-        try:
-            h, w = frames[0].shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out = cv2.VideoWriter(filepath, fourcc, 15.0, (w, h))
-            for f in frames:
-                out.write(f)
-            out.release()
-            print(f"[ALARM MANAGER] Saved incident video clip: {filepath}")
-        except Exception as e:
-            print(f"[ALARM MANAGER] Error saving incident video clip: {e}")
-
-    def acknowledge_alarm(self, camera_id):
-        """Silence audio alert for camera_id without interrupting detection."""
-        with self.lock:
-            if camera_id in self.camera_states:
-                self.camera_states[camera_id]["acknowledged"] = True
-                print(f"[ALARM MANAGER] Camera {camera_id} audio alarm acknowledged/silenced by user.")
-                return True
-        return False
-
-    def get_camera_state(self, camera_id):
-        with self.lock:
-            return self.camera_states.get(camera_id, self.get_default_state(camera_id))
-
-    def get_all_states(self):
+    def get_all_states(self) -> dict:
         with self.lock:
             return {cid: dict(st) for cid, st in self.camera_states.items()}
 
-    def get_all_incidents(self):
+    def get_all_incidents(self) -> list:
         with self.lock:
             return list(self.incidents_history)
 
-    def delete_incident(self, incident_id):
-        """Permanently deletes incident matching incident_id from backend history and file storage."""
-        with self.lock:
-            initial_len = len(self.incidents_history)
-            self.incidents_history = [inc for inc in self.incidents_history if inc.get("incident_id") != incident_id]
+    # ---------------------------------------------------------------- update
 
-            # Also clear active camera state if it matches this incident_id
+    def update_camera_state(
+        self,
+        camera_id:    str,
+        frame_1080p,
+        telemetry:    dict,
+        bullying_result=None,
+        bullying_sm=None,
+    ) -> dict:
+        """
+        Main update method called once per AI frame by AIEngine.
+
+        Parameters
+        ----------
+        camera_id       : str  — camera identifier
+        frame_1080p     : np.ndarray — annotated frame (for snapshot)
+        telemetry       : dict — full AI telemetry including BullyingResult fields
+        bullying_result : BullyingResult (optional) — direct access to result object
+        bullying_sm     : BullyingStateMachine (optional) — to notify on clip save
+
+        Returns: current camera alarm state dict
+        """
+        with self.lock:
+            if camera_id not in self.camera_states:
+                self.camera_states[camera_id] = self._default_state(camera_id)
+
+            st        = self.camera_states[camera_id]
+            now_ts    = time.time()
+            now_iso   = datetime.now().astimezone().isoformat()
+
+            # Extract key fields from telemetry
+            bullying_confirmed = telemetry.get("bullying_confirmed", False)
+            people_count       = telemetry.get("people_count", 0)
+
+            # ====================================================================
+            # ABSOLUTE SINGLE-PERSON RULE
+            # Hard guard: Alarm system & attack state MUST IMMEDIATELY RESET when tracked_people < 2
+            # ====================================================================
+            min_people = getattr(self.config, "MIN_PEOPLE_FOR_ATTACK", getattr(self.config, "MIN_PERSONS_FOR_BULLYING", 2))
+            if people_count < min_people:
+                bullying_confirmed = False
+                bullying_state_sm  = "NORMAL"
+                attack_type        = None
+                confidence         = 0.0
+                attacker_id        = None
+                victim_id          = None
+                confirmation_frames= 0
+                st["consecutive_hits"] = 0
+                st["alarm_active"]     = False
+                st["current_attack_type"] = None
+                st["current_attacker_id"] = None
+                st["current_victim_id"] = None
+                st["state"]            = "IDLE"
+
+            else:
+                bullying_state_sm  = telemetry.get("bullying_state", "NORMAL")  # from BullyingStateMachine
+                attack_type        = telemetry.get("attack_type")
+                confidence         = telemetry.get("confidence", 0.0)
+                attacker_id        = telemetry.get("attacker_track_id")
+                victim_id          = telemetry.get("victim_track_id")
+
+            reason             = telemetry.get("reason", "")
+            distance_norm      = telemetry.get("distance_normalized", 1.0)
+            contact_overlap    = telemetry.get("contact_overlap", 0.0)
+            confirmation_frames= telemetry.get("confirmation_frames", 0)
+
+            # Update passthrough telemetry fields
+            st["bullying_state"]      = bullying_state_sm
+            st["distance_normalized"] = distance_norm
+            st["contact_overlap"]     = contact_overlap
+
+            current = st["state"]
+
+            # ================================================================
+            # COOLDOWN: waiting between incidents
+            # ================================================================
+            if current == "COOLDOWN":
+                cooldown_start = st.get("_cooldown_start", now_ts)
+                elapsed        = now_ts - cooldown_start
+                rem            = max(0.0, self.config.COOLDOWN_PERIOD_SEC - elapsed)
+                st["cooldown_remaining_sec"] = round(rem, 1)
+                st["alarm_active"]           = False
+                st["consecutive_hits"]       = 0
+
+                if rem <= 0:
+                    print(f"[ALARM MANAGER] {camera_id}: COOLDOWN → IDLE")
+                    st["state"]       = "IDLE"
+                    st["incident_id"] = None
+                    st["acknowledged"]= False
+
+                return dict(st)
+
+            # ================================================================
+            # BullyingStateMachine says SAVE_CLIP → finalize incident
+            # ================================================================
+            if bullying_state_sm == "SAVE_CLIP" and current == "ALARM_ACTIVE":
+                print(f"\n[ALARM MANAGER] {camera_id}: ALARM_ACTIVE → COOLDOWN (clip will be saved)")
+                st["state"]        = "COOLDOWN"
+                st["alarm_active"] = False
+                st["consecutive_hits"] = 0
+                st["_cooldown_start"]  = now_ts
+                st["cooldown_remaining_sec"] = self.config.COOLDOWN_PERIOD_SEC
+
+                # Save incident record (clip_path will be updated later by camera_stream)
+                inc_id = st.get("incident_id", "INC-UNKNOWN")
+                now_dt = datetime.now()
+                inc_record = {
+                    "incident_id":  inc_id,
+                    "camera_id":    camera_id,
+                    "date":         now_dt.strftime("%Y-%m-%d"),
+                    "time":         now_dt.strftime("%H:%M:%S"),
+                    "event_type":   "BULLYING_CONFIRMED",
+                    "type":         st.get("attack_type") or "UNKNOWN",
+                    "action":       st.get("action") or "UNKNOWN",
+                    "confidence":   round(st.get("confidence", 0.0), 4),
+                    "status":       "BULLYING_CONFIRMED",
+                    "attacker_id":  st.get("attacker_id"),
+                    "victim_id":    st.get("victim_id"),
+                    "started_at":   st.get("started_at"),
+                    "ended_at":     now_iso,
+                    "reason":       st.get("reason", ""),
+                    "snapshot_path":st.get("snapshot_path"),
+                    "clip_path":    None,   # will be filled by set_clip_path()
+                    "timestamp":    now_iso,
+                }
+                self.incidents_history.insert(0, inc_record)
+                self._save_incidents()
+
+                # Notify BullyingStateMachine to reset to NORMAL
+                if bullying_sm is not None:
+                    bullying_sm.notify_clip_saved(camera_id)
+
+                return dict(st)
+
+            # ================================================================
+            # ALARM ACTIVE: bullying confirmed and ongoing
+            # ================================================================
+            if bullying_confirmed:
+                st["consecutive_hits"] += 1
+
+                if not st["alarm_active"]:
+                    # ---- First frame of confirmed bullying: create incident ----
+                    inc_num = len(self.incidents_history) + 1
+                    inc_id  = f"INC-{datetime.now().strftime('%Y%m%d')}-{inc_num:03d}"
+
+                    action_label = f"BULLY — {attack_type}" if attack_type else "PHYSICAL VIOLENCE"
+
+                    st["state"]        = "ALARM_ACTIVE"
+                    st["alarm_active"] = True
+                    st["incident_id"]  = inc_id
+                    st["event_type"]   = "BULLYING_CONFIRMED"
+                    st["attack_type"]  = attack_type
+                    st["action"]       = action_label
+                    st["confidence"]   = round(confidence, 4)
+                    st["attacker_id"]  = attacker_id
+                    st["victim_id"]    = victim_id
+                    st["started_at"]   = now_iso
+                    st["last_detected_at"] = now_iso
+                    st["reason"]       = reason
+                    st["acknowledged"] = False
+
+                    # Save snapshot JPEG
+                    if frame_1080p is not None:
+                        snap_name = f"{inc_id}_snap.jpg"
+                        snap_path = os.path.join(self.config.INCIDENTS_DIR, snap_name)
+                        try:
+                            cv2.imwrite(snap_path, frame_1080p)
+                            st["snapshot_path"] = f"/incidents/{snap_name}"
+                        except Exception as e:
+                            print(f"[ALARM MANAGER] Snapshot save error: {e}")
+
+                    print(f"\n{'='*50}")
+                    print(f" *** BULLYING ALARM TRIGGERED ***")
+                    print(f" Camera:     {camera_id}")
+                    print(f" Incident:   {inc_id}")
+                    print(f" Type:       {attack_type}")
+                    print(f" Attacker:   Track ID {attacker_id}")
+                    print(f" Victim:     Track ID {victim_id}")
+                    print(f" Confidence: {int(confidence*100)}%")
+                    print(f" Reason:     {reason}")
+                    print(f"{'='*50}\n")
+
+                else:
+                    # ---- Ongoing alarm: update fields dynamically ----
+                    st["last_detected_at"] = now_iso
+                    st["confidence"]       = round(max(confidence, st["confidence"]), 4)
+                    if attacker_id is not None:
+                        st["attacker_id"] = attacker_id
+                    if victim_id is not None:
+                        st["victim_id"]   = victim_id
+
+                return dict(st)
+
+            # ================================================================
+            # NO BULLYING: evidence absent or state machine not confirmed
+            # ================================================================
+            if current == "ALARM_ACTIVE":
+                # Alarm was running but bullying_confirmed just dropped to False.
+                # The BullyingStateMachine is counting stop_frames internally.
+                # We keep alarm_active True until SM signals SAVE_CLIP.
+                # (Do nothing here — SM will transition to SAVE_CLIP when ready)
+                return dict(st)
+
+            elif current in ("CONFIRMING",):
+                st["state"]            = "IDLE"
+                st["consecutive_hits"] = 0
+                st["alarm_active"]     = False
+
+            elif current == "IDLE":
+                pass   # Normal, nothing to do
+
+            return dict(st)
+
+    # ---------------------------------------------------------------- clip path
+
+    def set_clip_path(self, incident_id: str, clip_rel_path: str):
+        """
+        Called by camera_stream after the clip file has been saved to disk.
+        Updates both the in-memory incident record and incidents.json.
+        """
+        with self.lock:
+            # Update in-memory history
+            for inc in self.incidents_history:
+                if inc.get("incident_id") == incident_id:
+                    inc["clip_path"] = clip_rel_path
+                    break
+
+            # Update active camera state if it matches
             for cid, st in self.camera_states.items():
                 if st.get("incident_id") == incident_id:
-                    st["alarm_active"] = False
-                    st["state"] = "IDLE"
-                    st["incident_id"] = None
-                    st["consecutive_hits"] = 0
+                    st["clip_path"] = clip_rel_path
 
-            self._save_incidents_history()
-            print(f"[ALARM MANAGER] Deleted incident {incident_id}. History count: {initial_len} -> {len(self.incidents_history)}")
-            return len(self.incidents_history) < initial_len
+            self._save_incidents()
+            print(f"[ALARM MANAGER] Clip path updated for {incident_id}: {clip_rel_path}")
+
+    # ---------------------------------------------------------------- actions
+
+    def acknowledge_alarm(self, camera_id: str) -> bool:
+        """Silence audio alarm for camera_id."""
+        with self.lock:
+            if camera_id in self.camera_states:
+                self.camera_states[camera_id]["acknowledged"] = True
+                print(f"[ALARM MANAGER] {camera_id}: alarm acknowledged")
+                return True
+        return False
+
+    def delete_incident(self, incident_id: str) -> bool:
+        """Permanently delete an incident from history and reset active state if matched."""
+        with self.lock:
+            before = len(self.incidents_history)
+            self.incidents_history = [
+                inc for inc in self.incidents_history
+                if inc.get("incident_id") != incident_id
+            ]
+            for cid, st in self.camera_states.items():
+                if st.get("incident_id") == incident_id:
+                    st.update(self._default_state(cid))
+            self._save_incidents()
+            deleted = len(self.incidents_history) < before
+            print(f"[ALARM MANAGER] Deleted incident {incident_id}: {before}→{len(self.incidents_history)}")
+            return deleted
 
 
-# Global singleton instance
+# Global singleton
 alarm_manager = AlarmManager()

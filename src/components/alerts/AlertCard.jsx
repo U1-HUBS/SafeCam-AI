@@ -1,6 +1,6 @@
 import React from "react";
 import { motion } from "framer-motion";
-import { AlertTriangle, Clock, Camera, Eye, Check, Trash2 } from "lucide-react";
+import { AlertTriangle, Clock, Camera, Eye, Check, Trash2, Film } from "lucide-react";
 import AlertBadge from "./AlertBadge";
 import Button from "../ui/Button";
 
@@ -65,6 +65,15 @@ export const AlertCard = ({ alert, onView, onResolve, onDelete }) => {
             <span className="text-[#94A3B8] font-medium">Camera:</span>
             <span className="font-bold text-[#F8FAFC]">{alert.cameraName || alert.location || "Surveillance Zone"}</span>
           </div>
+          {(alert.type || alert.action) && (
+            <div className="flex items-center justify-between py-1 border-b border-white/5">
+              <span className="text-[#94A3B8] font-medium">Type:</span>
+              <span className="font-black text-[#EF4444] uppercase tracking-widest text-base">
+                {(alert.type || "").replace("BULLYING_CONFIRMED", "").trim() ||
+                  (alert.action || "UNKNOWN").replace("BULLY — ", "")}
+              </span>
+            </div>
+          )}
           <div className="flex items-center justify-between py-1 border-b border-white/5">
             <span className="text-[#94A3B8] font-medium">Action Triggered:</span>
             <span className="font-bold text-[#EF4444] uppercase tracking-wide">{alert.action || "PUSH / ATTACK"}</span>
@@ -82,8 +91,8 @@ export const AlertCard = ({ alert, onView, onResolve, onDelete }) => {
         </div>
       </div>
 
-      {/* Footer Actions: Delete, View Event, Resolve */}
-      <div className="mt-4 pt-3 border-t border-white/10 flex items-center justify-end gap-2.5">
+      {/* Footer Actions: Delete, View Clip, View Event, Resolve */}
+      <div className="mt-4 pt-3 border-t border-white/10 flex items-center justify-end gap-2.5 flex-wrap">
         {onDelete && (
           <Button
             variant="ghost"
@@ -94,6 +103,18 @@ export const AlertCard = ({ alert, onView, onResolve, onDelete }) => {
           >
             Delete
           </Button>
+        )}
+
+        {(alert.clipPath || alert.clip_path) && (
+          <a
+            href={`http://localhost:8000${alert.clipPath || alert.clip_path}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold border border-[#EF4444]/40 bg-[#EF4444]/10 text-[#EF4444] hover:bg-[#EF4444]/20 transition-colors"
+          >
+            <Film className="w-3.5 h-3.5" />
+            View Clip
+          </a>
         )}
 
         <Button

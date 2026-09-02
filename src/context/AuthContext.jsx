@@ -10,8 +10,14 @@ import React, { createContext, useContext, useState, useEffect, useRef } from "r
     const isRegisteringRef = useRef(false);
 
     useEffect(() => {
+      // Fallback safety timeout: Ensure loading finishes within 1s
+      const fallbackTimer = setTimeout(() => {
+        setLoading(false);
+      }, 1000);
+
       // Subscribe to Firebase Authentication State Changes
       const unsubscribe = authService.subscribeToAuthState(({ user: fbUser, userProfile: profile }) => {
+        clearTimeout(fallbackTimer);
         if (!isRegisteringRef.current) {
           setUser(fbUser);
           setUserProfile(profile);
@@ -19,7 +25,10 @@ import React, { createContext, useContext, useState, useEffect, useRef } from "r
         setLoading(false);
       });
 
-      return () => unsubscribe();
+      return () => {
+        clearTimeout(fallbackTimer);
+        unsubscribe();
+      };
     }, []);
 
     const login = async (email, password) => {

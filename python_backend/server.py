@@ -37,22 +37,37 @@ async def offer(request):
     pc = RTCPeerConnection()
     pcs.add(pc)
 
+    # Acquire shared SingleCameraPipeline for this camera ID from CameraManager
+    pipeline = camera_manager.get_or_create_pipeline(camera_id=camera_id, stream_url=stream_url)
+    pipeline.add_viewer()
+
+    cleaned_up = False
+
+    async def _cleanup_peer():
+        nonlocal cleaned_up
+        if cleaned_up:
+            return
+        cleaned_up = True
+        if pc in pcs:
+            pcs.discard(pc)
+        pipeline.remove_viewer()
+        if pipeline.active_viewers <= 0:
+            camera_manager.release_pipeline(camera_id)
+
     @pc.on("iceconnectionstatechange")
     async def on_iceconnectionstatechange():
         logger.info(f"[ICE STATE] Camera {camera_id}: {pc.iceConnectionState}")
         if pc.iceConnectionState in ["failed", "closed", "disconnected"]:
             await pc.close()
-            pcs.discard(pc)
+            await _cleanup_peer()
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
         logger.info(f"[CONNECTION STATE] Camera {camera_id}: {pc.connectionState}")
         if pc.connectionState in ["failed", "closed", "disconnected"]:
             await pc.close()
-            pcs.discard(pc)
+            await _cleanup_peer()
 
-    # Acquire shared SingleCameraPipeline for this camera ID from CameraManager
-    pipeline = camera_manager.get_or_create_pipeline(camera_id=camera_id, stream_url=stream_url)
     track = CameraTrack(pipeline=pipeline)
     pc.addTrack(track)
 
@@ -112,11 +127,22 @@ async def delete_alarm(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
+async def get_incidents(request):
+    """Returns all saved incident records with metadata."""
+    incidents = alarm_manager.get_all_incidents()
+    return web.json_response({
+        "status": "success",
+        "incidents": incidents,
+        "count": len(incidents)
+    })
+
 async def health(request):
     return web.json_response({
         "status": "online",
         "service": "SAFECAM AI Python WebRTC Server",
-        "models": ["YOLO11", "MediaPipe Pose", "RealPersonVerifier", "RWF-LSTM"],
+        "models": ["YOLO11n best_v1.pt — Punch/Kick/Normal (CPU)"],
+        "bytetrack": "DISABLED",
+        "mediapipe": "DISABLED",
         "active_streams": len(pcs),
         "incidents_count": len(alarm_manager.get_all_incidents())
     })
@@ -139,6 +165,7 @@ def create_app():
     app.router.add_get("/api/alarms/{camera_id}", get_alarms)
     app.router.add_post("/api/alarms/acknowledge", acknowledge_alarm)
     app.router.add_post("/api/alarms/delete", delete_alarm)
+    app.router.add_get("/api/incidents", get_incidents)
 
     # Static file route for incident clips & snapshots
     os.makedirs(alarm_config.INCIDENTS_DIR, exist_ok=True)
@@ -161,9 +188,10 @@ def create_app():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"\n==================================================")
-    print(f" SAFECAM AI Python WebRTC Server starting on http://localhost:{port}")
-    print(f" Endpoints: POST /offer | GET /health")
-    print(f" WebRTC 1080p Video + YOLO11 + MediaPipe Pose active!")
-    print(f"==================================================\n")
+    print(f" SAFECAM AI WebRTC Server  →  http://localhost:{port}")
+    print(f" Model:      best_v1.pt (YOLO11n — Punch/Kick/Normal)")
+    print(f" ByteTrack:  DISABLED | MediaPipe: DISABLED")
+    print(f" Endpoints:  POST /offer | GET /health | GET /api/incidents")
+    print(f"==================================================")
     app = create_app()
     web.run_app(app, host="0.0.0.0", port=port)

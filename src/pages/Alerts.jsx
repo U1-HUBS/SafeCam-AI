@@ -53,6 +53,8 @@ export const Alerts = () => {
 
   useEffect(() => {
     fetchIncidents();
+    const interval = setInterval(fetchIncidents, 3000);
+    return () => clearInterval(interval);
   }, []);
 
   const deletedIds = getDeletedAlertIds();
@@ -80,16 +82,19 @@ export const Alerts = () => {
       return {
         id: inc.incident_id || "INC-000",
         cameraName: `Camera ${inc.camera_id || "01"}`,
-        type: inc.event_type || "BULLYING_CONFIRMED",
+        type: inc.type || inc.event_type || "BULLYING_CONFIRMED",
         severity: "critical",
         status: "active",
         timeAgo: formattedTime,
+        date: inc.date || (inc.started_at ? new Date(inc.started_at).toLocaleDateString() : "—"),
+        time: inc.time || (inc.started_at ? new Date(inc.started_at).toLocaleTimeString() : "—"),
         confidence: inc.confidence != null ? inc.confidence : 0.88,
-        action: inc.action || "PHYSICAL VIOLENCE",
+        action: inc.action || inc.type || "PHYSICAL VIOLENCE",
         attackerId: inc.attacker_id,
         victimId: inc.victim_id,
-        clipPath: inc.clip_path,
-        snapshotPath: inc.snapshot_path,
+        clipPath: inc.clip_path || null,
+        clip_path: inc.clip_path || null,
+        snapshotPath: inc.snapshot_path ? `http://localhost:8000${inc.snapshot_path}` : null,
         reason: inc.reason || "Confirmed Violence"
       };
     })
