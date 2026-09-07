@@ -45,10 +45,12 @@ python_backend/incidents/
 # Large model files / unnecessary checkpoints / archives
 *.pth
 *.pt
+!yolo11n-pose.pt
+!yolo11n.pt
+!python_backend/yolo11n-pose.pt
 *.keras
 *.zip
 askpass.bat
-inspect_model.py
 python_backend/models/
 
 # OS and Editor files
