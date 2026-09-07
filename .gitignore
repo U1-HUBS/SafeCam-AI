@@ -42,8 +42,13 @@ python_backend/incidents/
 *.mov
 *.mkv
 
-# Large model files / unnecessary checkpoints (>100MB)
+# Large model files / unnecessary checkpoints / archives
 *.pth
+*.pt
+*.keras
+*.zip
+askpass.bat
+inspect_model.py
 python_backend/models/
 
 # OS and Editor files
