@@ -1,14 +1,12 @@
 """
-SAFECAM AI Engine — Rebuilt Modular Architecture
+SAFECAM AI Engine — LSTM Sequence Pipeline
 =================================================
-Orchestrates the 7 clean AI sub-components:
-  1. PersonDetector        — COCO Person Detector (yolo11n.pt, classes=[0])
-  2. PersonTrackerWrapper  — ByteTrack / LightweightTracker
-  3. ActionDetector        — Custom Action YOLO11n (best_v1.pt: PUNCH, KICK, NORMAL)
-  4. InteractionDetector   — 2+ Person Pair Geometry & Motion Direction
-  5. ContactDetector       — Contact Landing Evidence Calculation
-  6. AttackEngine          — 5-State State Machine (NORMAL -> CONFIRMED_ATTACK)
-  7. AlarmGate             — Single Authoritative Alarm Safety Gate
+Replaces the old state-machine with a deep sequence model:
+  1. YOLOv11 Pose Tracking (Bounding box + Keypoints)
+  2. LSTM Sequence Buffer (Rolling 30 frames per track)
+  3. LSTM Keras Model (Predicts PUNCH/KICK/NEUTRAL)
+  4. Temporal Confirmation (Anti-flicker logic)
+  5. Interaction Validator (Physical contact confirmation)
 """
 
 import os
@@ -16,7 +14,10 @@ import cv2
 import time
 import numpy as np
 from typing import Tuple, Dict, List, Optional
+import tensorflow as tf
+from ultralytics import YOLO
 
+# Load config and manager
 try:
     from alarm_config import alarm_config
 except ImportError:
@@ -27,323 +28,262 @@ try:
 except ImportError:
     from python_backend.alarm_manager import alarm_manager
 
-# Modular AI Package Imports
-try:
-    from ai.person_detector import PersonDetector
-    from ai.tracker import PersonTrackerWrapper
-    from ai.action_detector import ActionDetector
-    from ai.interaction_detector import InteractionDetector
-    from ai.contact_detector import ContactDetector
-    from ai.attack_engine import AttackEngine, AttackEngineResult
-    from ai.alarm_gate import AlarmGate, AlarmGateResult
-except ImportError:
-    from python_backend.ai.person_detector import PersonDetector
-    from python_backend.ai.tracker import PersonTrackerWrapper
-    from python_backend.ai.action_detector import ActionDetector
-    from python_backend.ai.interaction_detector import InteractionDetector
-    from python_backend.ai.contact_detector import ContactDetector
-    from python_backend.ai.attack_engine import AttackEngine, AttackEngineResult
-    from python_backend.ai.alarm_gate import AlarmGate, AlarmGateResult
+# AI Subcomponents
+from ai.normalizer import normalize_frame
+from ai.lstm_sequence_buffer import LSTMSequenceBuffer
+from ai.temporal_confirmation import TemporalConfirmation
+from ai.interaction_validator import InteractionValidator
 
-# Drawing BGR Colors
+# Drawing Colors
 _WHITE = (255, 255, 255)
 _GREEN = (0, 255, 0)
 _RED   = (0, 0, 255)
 _CYAN  = (255, 212, 0)
-_YELLOW= (0, 255, 255)
 
+# YOLO Pose Indices for LSTM (12 landmarks)
+# L Arm (5,7,9), R Arm (6,8,10), L Leg (11,13,15), R Leg (12,14,16)
+YOLO_KP_INDICES = [5, 7, 9, 6, 8, 10, 11, 13, 15, 12, 14, 16]
+
+LSTM_CLASSES = ['NEUTRAL', 'PUNCH', 'KICK']
 
 class AIEngine:
-    """
-    Top-level SAFECAM AI Orchestrator.
-    Cleanly connects all modular sub-components.
-    """
-
     def __init__(self, model_path: str = None):
-        self.config     = alarm_config
-        self.model_path = model_path or self.config.MODEL_PATH
-        self.imgsz      = self.config.YOLO_IMGSZ
-        self.device     = self.config.YOLO_DEVICE
+        self.config = alarm_config
+        self.device = self.config.YOLO_DEVICE
+        
+        print("\n========================================")
+        print(" SAFECAM AI ENGINE (LSTM SEQUENCE MODE)")
+        print("========================================")
 
-        print("\n================================")
-        print(" SAFECAM AI ENGINE REBUILD")
-        print("================================")
+        # 1. YOLO Pose Model
+        self.yolo_model = YOLO("yolo11n-pose.pt")
+        self.person_conf = getattr(self.config, "PERSON_CONFIDENCE", 0.30)
+        self.imgsz = self.config.YOLO_IMGSZ
 
-        # 1. Person Detector (COCO Person Class [0])
-        person_conf = getattr(self.config, "PERSON_CONFIDENCE", 0.30)
-        self.person_detector = PersonDetector(
-            model_path=self.model_path,
-            imgsz=self.imgsz,
-            device=self.device,
-            conf_thresh=person_conf
-        )
+        # 2. LSTM Sequence Model
+        model_file = os.path.join(os.path.dirname(__file__), 'ai', 'safecam_lstm_24.keras')
+        self.lstm_model = tf.keras.models.load_model(model_file)
+        
+        # 3. Buffers and Validators
+        self.sequence_buffers = {} # camera_id -> LSTMSequenceBuffer
+        self.temporal_confirmations = {} # (camera_id, track_id) -> TemporalConfirmation
+        self.interaction_validators = {} # camera_id -> InteractionValidator
 
-        # 2. Person Tracker (ByteTrack / LightweightTracker)
-        self.tracker_wrapper = PersonTrackerWrapper(
-            iou_thresh=getattr(self.config, "TRACKER_IOU_THRESHOLD", 0.30),
-            max_missing=getattr(self.config, "TRACKER_MAX_MISSING_FRAMES", 5)
-        )
+        print(" SAFECAM AI Engine Rebuild Ready!\n========================================\n")
 
-        # 3. Action Detector (Custom YOLO11n best_v1.pt, conf_thresh=0.05 for raw candidate intake)
-        self.action_detector = ActionDetector(
-            model_path=self.model_path,
-            imgsz=self.imgsz,
-            device=self.device,
-            conf_thresh=0.05
-        )
+    def _get_camera_state(self, camera_id):
+        if camera_id not in self.sequence_buffers:
+            self.sequence_buffers[camera_id] = LSTMSequenceBuffer(sequence_length=30)
+            self.interaction_validators[camera_id] = InteractionValidator()
+        return self.sequence_buffers[camera_id], self.interaction_validators[camera_id]
 
-        # 4. Interaction Detector (Pair geometry & direction)
-        self.interaction_detector = InteractionDetector(frame_width=1920, frame_height=1080)
-
-        # 5. Contact Detector (Contact landing evidence)
-        self.contact_detector = ContactDetector(
-            min_contact_score=getattr(self.config, "MIN_CONTACT_SCORE", 0.50),
-            contact_dist_thresh=getattr(self.config, "CONTACT_DISTANCE_THRESHOLD", 0.12),
-            overlap_thresh=getattr(self.config, "CONTACT_OVERLAP_THRESHOLD", 0.05)
-        )
-
-        # 6. Attack Engine (5-State State Machine)
-        confirm_frames = getattr(self.config, "BULLYING_CONFIRMATION_FRAMES", 3)
-        stop_frames = getattr(self.config, "BULLYING_STOP_FRAMES", 10)
-        self.attack_engine = AttackEngine(confirm_frames=confirm_frames, stop_frames=stop_frames)
-
-        # 7. Alarm Safety Gate (Single Authoritative Alarm Gate)
-        self.alarm_gate = AlarmGate(min_people=2, min_confirm_frames=confirm_frames)
-
-        self.last_yolo_inference_ms: float = 0.0
-        print(" SAFECAM AI Engine Rebuild Ready!\n================================\n")
+    def _get_temporal(self, camera_id, track_id):
+        key = (camera_id, track_id)
+        if key not in self.temporal_confirmations:
+            self.temporal_confirmations[key] = TemporalConfirmation(confidence_threshold=0.80, min_consecutive_frames=3)
+        return self.temporal_confirmations[key]
 
     def process_frame(self, frame_1080p: np.ndarray, camera_id: str = "default") -> Tuple[np.ndarray, dict]:
-        """
-        Processes one 1080p frame through the clean 7-component modular pipeline.
-        Returns: (annotated_frame, telemetry_dict)
-        """
         if frame_1080p is None:
             return None, {}
 
         t_start = time.time()
         orig_h, orig_w = frame_1080p.shape[:2]
+        seq_buffer, inter_validator = self._get_camera_state(camera_id)
 
-        # ---------------------------------------------------------------------
-        # STEP 1: Person Detection (Every visible person gets a box)
-        # ---------------------------------------------------------------------
-        person_detections = self.person_detector.detect(frame_1080p)
-
-        # ---------------------------------------------------------------------
-        # STEP 2: Tracker Update (Stable ByteTrack / LightweightTracker IDs)
-        # ---------------------------------------------------------------------
-        tracked_persons = self.tracker_wrapper.update(camera_id, person_detections)
-        people_count = len(tracked_persons)
-
-        # ---------------------------------------------------------------------
-        # STEP 3: Action Classification (Custom best_v1.pt) & Association
-        # ---------------------------------------------------------------------
-        action_preds, person_action_map = self.action_detector.detect_and_associate(frame_1080p, tracked_persons)
-        any_action = any(act in ("PUNCH", "KICK") for act in person_action_map.values())
-        raw_act_type = next((act for act in person_action_map.values() if act in ("PUNCH", "KICK")), "NONE")
-
-        # ---------------------------------------------------------------------
-        # STEP 4: Interaction Detection (Evaluated ONLY when tracked_people >= 2)
-        # ---------------------------------------------------------------------
-        cam_history = getattr(self.attack_engine, "_get_camera_state")(camera_id)
-        pair_interaction = self.interaction_detector.evaluate_interaction(
-            camera_id=camera_id,
-            tracked_persons=tracked_persons,
-            person_action_map=person_action_map,
-            camera_history=cam_history
+        # 1. YOLO Pose Tracking
+        # persist=True enables ByteTrack under the hood
+        results = self.yolo_model.track(
+            frame_1080p, 
+            classes=[0], # Person only
+            conf=self.person_conf, 
+            persist=True, 
+            verbose=False,
+            imgsz=self.imgsz,
+            device=self.device
         )
 
-        # ---------------------------------------------------------------------
-        # STEP 5: Contact Landing Validation
-        # ---------------------------------------------------------------------
-        contact_evidence = self.contact_detector.evaluate_contact(pair_interaction) if pair_interaction else None
+        tracked_persons = []
+        active_track_ids = []
+        
+        if results and len(results) > 0:
+            result = results[0]
+            if result.boxes is not None and result.boxes.id is not None:
+                boxes = result.boxes.xyxy.cpu().numpy()
+                track_ids = result.boxes.id.cpu().numpy().astype(int)
+                keypoints_all = result.keypoints.xy.cpu().numpy() # (N, 17, 2)
+                
+                for i in range(len(track_ids)):
+                    tid = track_ids[i]
+                    bbox = boxes[i]
+                    kps = keypoints_all[i]
+                    
+                    active_track_ids.append(tid)
+                    
+                    # Extract 12 keypoints
+                    target_kps = kps[YOLO_KP_INDICES] # (12, 2)
+                    flat_kps = target_kps.flatten()
+                    
+                    # Convert absolute px to normalized (0-1) to match Mediapipe training
+                    for j in range(12):
+                        flat_kps[j*2] /= orig_w
+                        flat_kps[j*2+1] /= orig_h
+                        
+                    norm_kps = normalize_frame(flat_kps)
+                    seq_buffer.update(tid, norm_kps)
+                    
+                    tracked_persons.append({
+                        'person_id': tid,
+                        'bbox': bbox,
+                        'keypoints': target_kps.flatten(), # absolute px for interaction validator
+                        'norm_kps': norm_kps,
+                        'action': 'NEUTRAL',
+                        'confidence': 0.0
+                    })
 
-        # ---------------------------------------------------------------------
-        # STEP 6: 5-State Attack Engine Process
-        # ---------------------------------------------------------------------
-        attack_result: AttackEngineResult = self.attack_engine.process(
-            camera_id=camera_id,
-            tracked_persons=tracked_persons,
-            pair_interaction=pair_interaction,
-            contact_evidence=contact_evidence,
-            any_action_detected=any_action,
-            raw_action_type=raw_act_type
-        )
+        # Tick buffer to remove stale tracks
+        seq_buffer.tick(active_track_ids)
 
-        # ---------------------------------------------------------------------
-        # STEP 7: Single Authoritative Alarm Safety Gate
-        # ---------------------------------------------------------------------
-        gate_result: AlarmGateResult = self.alarm_gate.evaluate_gate(
-            people_count=people_count,
-            attack_result=attack_result,
-            contact_evidence=contact_evidence
-        )
-
-        # Clean Structured Console Diagnostic Print per User Specification
-        print(f"\n--- [FRAME DIAGNOSTIC TRACE | Camera: {camera_id}] ---")
-        print(f"[YOLO DETECTIONS] Count: {people_count} | Boxes: {[ [det.x1, det.y1, det.x2, det.y2] for det in person_detections ]}")
-        print(f"[BYTETRACK] Active Track IDs: {[tp.track_id for tp in tracked_persons]}")
-
-        for tp in tracked_persons:
-            st = self.action_detector.get_track_state(tp.track_id)
-            pred_act = person_action_map.get(tp.track_id, "NORMAL")
-            act_conf = st.action_confidence if pred_act in ("PUNCH", "KICK") else st.last_raw_conf
-            print(f"\n[ACTION DEBUG]")
-            print(f"Track={tp.track_id}")
-            print(f"PUNCH={st.raw_punch_conf:.2f}")
-            print(f"KICK={st.raw_kick_conf:.2f}")
-            print(f"NORMAL={st.raw_normal_conf:.2f}")
-            print(f"Predicted={pred_act}")
-            print(f"Confidence={act_conf:.2f}")
-            print(f"SuppressionInfo={st.debug_reason}")
-
-        attacker_id = pair_interaction.attacker_tp.track_id if pair_interaction else (attack_result.attacker_track_id if attack_result else None)
-        victim_id = pair_interaction.victim_tp.track_id if (pair_interaction and pair_interaction.victim_tp) else (attack_result.victim_track_id if attack_result else None)
-        assoc_reason = "Success" if (attacker_id and victim_id) else ("No pair interaction" if not pair_interaction else ("Air punch/kick (no victim confirmed)" if pair_interaction.victim_tp is None else "Association failed"))
-
-        print(f"\n[ASSOCIATION DEBUG]")
-        print(f"Attacker={'Track ' + str(attacker_id) if attacker_id is not None else 'None'}")
-        print(f"Victim={'Track ' + str(victim_id) if victim_id is not None else 'None'}")
-        print(f"Reason={assoc_reason}")
-
-        print(f"\n[TEMPORAL DEBUG]")
-        print(f"CandidateFrames={max([st.candidate_count for st in self.action_detector.track_states.values()], default=0)}/{self.action_detector.min_action_frames}")
-        print(f"Confirmed={attack_result.confirmation_frames}/{self.attack_engine.confirm_frames}")
-        print(f"State={attack_result.state}")
-
-        print(f"\n[FINAL DEBUG]")
-        print(f"Result={'ATTACK' if gate_result.should_alarm else 'NORMAL'}")
-        print(f"Reason={gate_result.reason}\n")
-
-        # Build tracked persons payload for API / Telemetry
-        tracked_persons_payload = []
-        punch_count = 0
-        kick_count = 0
-
-        for tp in tracked_persons:
-            det = tp.detection
-            st = self.action_detector.get_track_state(tp.track_id)
-            # Display action suppresses PUNCH/KICK for single person
-            action_label = person_action_map.get(tp.track_id, "NORMAL") if (person_action_map and people_count >= 2) else "NORMAL"
+        # 2. LSTM Inference
+        for person in tracked_persons:
+            tid = person['person_id']
+            seq = seq_buffer.get_sequence(tid)
             
-            if action_label == "PUNCH":
-                punch_count += 1
-            elif action_label == "KICK":
-                kick_count += 1
+            temporal = self._get_temporal(camera_id, tid)
+            
+            if seq is not None:
+                # seq is (30, 24)
+                X = np.expand_dims(seq, axis=0) # (1, 30, 24)
+                preds = self.lstm_model.predict(X, verbose=0)[0]
+                
+                class_idx = np.argmax(preds)
+                conf = float(preds[class_idx])
+                raw_action = LSTM_CLASSES[class_idx]
+                
+                confirmed_action = temporal.update(raw_action, conf)
+                
+                person['action'] = temporal.last_confirmed_action if temporal.last_confirmed_action else "NEUTRAL"
+                person['confidence'] = conf
 
+            else:
+                temporal.reset()
+
+        # 3. Physical Interaction Validation
+        confirmed_alerts = inter_validator.validate(tracked_persons)
+        
+        # Determine Alarm State
+        should_alarm = len(confirmed_alerts) > 0
+        attack_type = confirmed_alerts[0]['action'] if should_alarm else "NONE"
+        attacker_id = confirmed_alerts[0]['striker_id'] if should_alarm else None
+        victim_id = confirmed_alerts[0]['target_id'] if should_alarm else None
+
+        # Build Telemetry
+        tracked_persons_payload = []
+        punch_count = sum(1 for p in tracked_persons if p['action'] == 'PUNCH')
+        kick_count = sum(1 for p in tracked_persons if p['action'] == 'KICK')
+
+        for p in tracked_persons:
             role = "normal"
-            if attack_result.confirmed_attack:
-                if attack_result.attacker_track_id == tp.track_id:
-                    role = "attacker"
-                elif attack_result.victim_track_id == tp.track_id:
-                    role = "victim"
-
-            act_conf = st.action_confidence if action_label in ("PUNCH", "KICK") else det.confidence
-
+            if should_alarm:
+                if p['person_id'] == attacker_id: role = "attacker"
+                elif p['person_id'] == victim_id: role = "victim"
+                
+            x1, y1, x2, y2 = p['bbox']
             tracked_persons_payload.append({
-                "track_id": tp.track_id,
+                "track_id": p['person_id'],
                 "role": role,
-                "action": action_label,
-                "confidence": round(act_conf, 4),
-                "bbox_1080": [det.x1, det.y1, det.x2, det.y2],
+                "action": p['action'],
+                "confidence": round(p['confidence'], 4),
+                "bbox_1080": [float(x1), float(y1), float(x2), float(y2)],
                 "bbox_640": [
-                    det.x1 * (640.0 / orig_w),
-                    det.y1 * (640.0 / orig_h),
-                    det.x2 * (640.0 / orig_w),
-                    det.y2 * (640.0 / orig_h),
+                    float(x1 * (640.0 / orig_w)),
+                    float(y1 * (640.0 / orig_h)),
+                    float(x2 * (640.0 / orig_w)),
+                    float(y2 * (640.0 / orig_h)),
                 ],
             })
 
         telemetry_for_alarm = {
             "camera_id": camera_id,
-            "people_count": people_count,
+            "people_count": len(tracked_persons),
             "tracked_persons": tracked_persons_payload,
-            "attack_state": attack_result.state,
-            "confirmed_attack": attack_result.confirmed_attack,
-            "should_alarm": gate_result.should_alarm,
-            "bullying_confirmed": gate_result.should_alarm,
-            "attacker_id": gate_result.attacker_track_id,
-            "victim_id": gate_result.victim_track_id,
-            "attack_type": gate_result.attack_type,
-            "confidence": gate_result.confidence,
-            "reason": gate_result.reason,
+            "attack_state": "ALARM_ACTIVE" if should_alarm else "NORMAL",
+            "confirmed_attack": should_alarm,
+            "should_alarm": should_alarm,
+            "bullying_confirmed": should_alarm,
+            "attacker_id": attacker_id,
+            "victim_id": victim_id,
+            "attack_type": attack_type,
+            "confidence": confirmed_alerts[0]['confidence'] if should_alarm else 0.0,
+            "reason": f"Physical {attack_type} contact confirmed" if should_alarm else "",
             "timestamp": time.time()
         }
 
-        # Update AlarmManager singleton
-        annotated_frame = self._render_frame(frame_1080p, tracked_persons, attack_result, gate_result, person_action_map)
+        # Render HUD
+        annotated_frame = self._render_frame(frame_1080p, tracked_persons, confirmed_alerts, should_alarm)
         alarm_manager.update_camera_state(camera_id, annotated_frame, telemetry_for_alarm)
 
         total_ms = (time.time() - t_start) * 1000.0
 
         ai_telemetry = {
             "camera_id": camera_id,
-            "people_count": people_count,
+            "people_count": len(tracked_persons),
             "punch_count": punch_count,
             "kick_count": kick_count,
             "yolo_imgsz": self.imgsz,
-            "yolo_conf_threshold": getattr(self.config, "YOLO_CONF_THRESHOLD", 0.10),
             "tracked_persons_count": len(tracked_persons),
-            "attack_state": attack_result.state,
-            "confirmed_attack": attack_result.confirmed_attack,
-            "should_alarm": gate_result.should_alarm,
+            "confirmed_attack": should_alarm,
+            "should_alarm": should_alarm,
             "total_ai_ms": round(total_ms, 2),
             "alarm_state": alarm_manager.get_camera_state(camera_id)
         }
 
         return annotated_frame, ai_telemetry
 
-    def _render_frame(
-        self,
-        frame: np.ndarray,
-        tracked_persons: List,
-        attack_result: AttackEngineResult,
-        gate_result: AlarmGateResult,
-        person_action_map: Optional[Dict[int, str]] = None
-    ) -> np.ndarray:
-        """
-        Renders bounding boxes and status HUD according to strict clean label rules:
-          - Confirmed Attacker -> RED with "ID:X PUNCH 91% - ATTACKER"
-          - Confirmed Victim   -> GREEN with "ID:X NORMAL 87% - VICTIM"
-          - Candidate Action   -> YELLOW/CYAN with "ID:X PUNCH 91%"
-          - Normal             -> WHITE with "ID:X NORMAL 85%"
-        """
+    def _render_frame(self, frame, tracked_persons, confirmed_alerts, should_alarm):
         out = frame.copy()
-        people_count = len(tracked_persons)
+        
+        attacker_id = confirmed_alerts[0]['striker_id'] if should_alarm else None
+        victim_id = confirmed_alerts[0]['target_id'] if should_alarm else None
 
-        for tp in tracked_persons:
-            det = tp.detection
-            st = self.action_detector.get_track_state(tp.track_id)
-            act = person_action_map.get(tp.track_id, "NORMAL") if (person_action_map and people_count >= 2) else "NORMAL"
-            act_conf = st.action_confidence if act in ("PUNCH", "KICK") else det.confidence
-            conf_pct = int(act_conf * 100)
+        for p in tracked_persons:
+            tid = p['person_id']
+            act = p['action']
+            conf_pct = int(p['confidence'] * 100)
+            x1, y1, x2, y2 = map(int, p['bbox'])
 
-            if gate_result.should_alarm and gate_result.attacker_track_id == tp.track_id:
+            if should_alarm and tid == attacker_id:
                 color = _RED
-                label = f"ID:{tp.track_id} {act} {conf_pct}% - ATTACKER"
-            elif gate_result.should_alarm and gate_result.victim_track_id == tp.track_id:
+                label = f"ID:{tid} {act} {conf_pct}% - ATTACKER"
+            elif should_alarm and tid == victim_id:
                 color = _GREEN
-                label = f"ID:{tp.track_id} {act} {int(det.confidence * 100)}% - VICTIM"
+                label = f"ID:{tid} {act} {conf_pct}% - VICTIM"
             else:
                 if act in ("PUNCH", "KICK"):
-                    color = (0, 255, 255)  # Yellow/Cyan highlight for action candidate
-                    label = f"ID:{tp.track_id} {act} {conf_pct}%"
+                    color = _CYAN
+                    label = f"ID:{tid} {act} {conf_pct}%"
                 else:
                     color = _WHITE
-                    label = f"ID:{tp.track_id} NORMAL {conf_pct}%"
+                    label = f"ID:{tid} NORMAL {conf_pct}%"
 
-            x1, y1, x2, y2 = det.x1, det.y1, det.x2, det.y2
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
-
+            
             # Draw label banner
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(out, (x1, y1 - th - 10), (x1 + tw + 10, y1), color, -1)
             cv2.putText(out, label, (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _WHITE if color == _RED else (0, 0, 0), 2)
+            
+            # Optional: Draw Pose skeleton points
+            kps = p['keypoints'].reshape((12, 2))
+            for pt in kps:
+                if pt[0] > 0 and pt[1] > 0:
+                    cv2.circle(out, (int(pt[0]), int(pt[1])), 4, color, -1)
 
-        # Draw HUD status header badge at top-right
-        if gate_result.should_alarm:
+        # Draw HUD status header badge
+        if should_alarm:
             hud_bg = _RED
-            hud_txt = f"CONFIRMED BULLYING | {gate_result.attack_type}"
+            attack_type = confirmed_alerts[0]['action']
+            hud_txt = f"CONFIRMED BULLYING | {attack_type}"
         else:
             hud_bg = (20, 20, 20)
             hud_txt = f"MONITORING ACTIVE | {len(tracked_persons)} PERSONS"
@@ -356,7 +296,7 @@ class AIEngine:
         by2 = by1 + th + 16
 
         cv2.rectangle(out, (bx1, by1), (bx2, by2), hud_bg, -1)
-        cv2.rectangle(out, (bx1, by1), (bx2, by2), _WHITE if gate_result.should_alarm else (60, 60, 60), 2)
+        cv2.rectangle(out, (bx1, by1), (bx2, by2), _WHITE if should_alarm else (60, 60, 60), 2)
         cv2.putText(out, hud_txt, (bx1 + 10, by1 + th + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.65, _WHITE, 2)
 
         return out

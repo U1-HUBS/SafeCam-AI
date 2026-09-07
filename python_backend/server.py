@@ -140,9 +140,9 @@ async def health(request):
     return web.json_response({
         "status": "online",
         "service": "SAFECAM AI Python WebRTC Server",
-        "models": ["YOLO11n best_v1.pt — Punch/Kick/Normal (CPU)"],
-        "bytetrack": "DISABLED",
-        "mediapipe": "DISABLED",
+        "models": ["YOLO11n Pose", "safecam_lstm_24.keras"],
+        "bytetrack": "ENABLED",
+        "lstm_pipeline": "ENABLED",
         "active_streams": len(pcs),
         "incidents_count": len(alarm_manager.get_all_incidents())
     })
@@ -189,8 +189,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"\n==================================================")
     print(f" SAFECAM AI WebRTC Server  →  http://localhost:{port}")
-    print(f" Model:      best_v1.pt (YOLO11n — Punch/Kick/Normal)")
-    print(f" ByteTrack:  DISABLED | MediaPipe: DISABLED")
+    print(f" Models:     yolo11n-pose.pt + safecam_lstm_24.keras")
+    print(f" Pipeline:   YOLO Pose -> LSTM Sequence Buffer")
     print(f" Endpoints:  POST /offer | GET /health | GET /api/incidents")
     print(f"==================================================")
     app = create_app()

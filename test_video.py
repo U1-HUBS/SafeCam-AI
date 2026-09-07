@@ -26,7 +26,7 @@ def run_video_test(video_path, save_output=False, display=True):
     print(f" Video Source: {video_path}")
     print(f" Interval:     Every {interval}rd frame")
     print(f" Threshold:    {conf_thresh*100:.0f}%")
-    print(f" Model:        {alarm_config.MODEL_PATH}")
+    print(f" Models:       yolo11n-pose.pt + safecam_lstm_24.keras")
     print(f"==================================================\n")
 
     print("[INFO] Initializing Local YOLO11 AIEngine...")
